@@ -9,22 +9,26 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Required to create releases
+      contents: write # Required to create releases and upload assets
     steps:
       - uses: actions/checkout@v3
 
-      # 1. Wait for OBS to build (simplistic wait)
+      # 1. Wait for OBS to build (simple wait to give OBS a head start)
       - name: Sleep for 2 minutes to let OBS build
         run: sleep 120
 
       # 2. Download the RPM from your public OBS URL
       - name: Download RPM
         run: |
-          # Logic to find the filename based on the tag
+          # Extract version from tag (e.g., refs/tags/0.0.4 -> 0.0.4)
           VERSION=${GITHUB_REF#refs/tags/}
-          # Create directory to store downloads
+          echo "Downloading RPMs for version $VERSION..."
+
+          # Create a directory to keep things clean
           mkdir -p downloads
-          # Download matching RPMs
+
+          # Download recursively (-r), no directories (-nd), accept only matching files (-A)
+          # We use quotes around the URL to be safe
           wget -r -l1 -nd -A "zypperx-$VERSION-*.noarch.rpm" -P downloads "https://download.opensuse.org/repositories/home:/itachi_re/openSUSE_Tumbleweed/noarch/"
 
       # 3. Upload to GitHub Release
@@ -32,3 +36,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: downloads/*.rpm
+          draft: false
+          prerelease: false
+          generate_release_notes: true
