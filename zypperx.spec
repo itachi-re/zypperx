@@ -22,7 +22,6 @@ URL:            https://github.com/itachi-re/zypperx
 Source:         %{name}-%{version}.tar.zst
 BuildRequires:  python3-base
 BuildRequires:  python-rpm-macros
-# Runtime dependencies (Tumbleweed automatically pulls python3-rich)
 Requires:       python3
 Requires:       python3-rich
 Requires:       zypper
@@ -43,11 +42,7 @@ It behaves exactly like zypper but runs download operations in parallel.
 # Pure Python script, no compilation needed.
 
 %install
-# 1. Install the script to /usr/bin/zypperx (Dropping the .py extension)
-install -D -m 0755 zypperx.py %{buildroot}%{_bindir}/zypperx
-
-# 2. Shebang Fix: Replace "#!/usr/bin/env python3" with "#!/usr/bin/python3"
-# This makes it a proper system command compliant with openSUSE security policies.
+install -D -m 0755 zypperx %{buildroot}%{_bindir}/zypperx
 sed -i 's|#!/usr/bin/env python3|#!/usr/bin/python3|' %{buildroot}%{_bindir}/zypperx
 
 %files
