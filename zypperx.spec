@@ -22,17 +22,18 @@ URL:            https://github.com/itachi-re/zypperx
 Source:         %{name}-%{version}.tar.zst
 BuildRequires:  python3-base
 BuildRequires:  python-rpm-macros
+BuildRequires:  python3-rich
 Requires:       python3
 Requires:       python3-rich
 Requires:       zypper
 Requires:       util-linux
+Conflicts:      zypperoni
 BuildArch:      noarch
 
 %description
 ZypperX is a parallel wrapper for the zypper package manager.
 It accelerates repository refreshes and package downloads by running
 them in isolated chroot environments concurrently.
-
 It behaves exactly like zypper but runs download operations in parallel.
 
 %prep
@@ -44,10 +45,15 @@ It behaves exactly like zypper but runs download operations in parallel.
 %install
 install -D -m 0755 zypperx %{buildroot}%{_bindir}/zypperx
 sed -i 's|#!/usr/bin/env python3|#!/usr/bin/python3|' %{buildroot}%{_bindir}/zypperx
-
+%check
+%{buildroot}%{_bindir}/zypperx --version
 %files
 %license LICENSE
 %doc README.md
 %{_bindir}/zypperx
 
 %changelog
+* Sat Nov 22 2025 itachi_re <xanbenson99@gmail.com> - 0.0.2-0
+- Initial package release
+- Implemented parallel download with chroot isolation
+- Added atomic locking and signal handling
