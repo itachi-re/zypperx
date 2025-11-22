@@ -8,10 +8,12 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to create releases
     steps:
       - uses: actions/checkout@v3
 
-      # 1. Wait for OBS to build (simplistic wait, or just assume it's fast)
+      # 1. Wait for OBS to build (simplistic wait)
       - name: Sleep for 2 minutes to let OBS build
         run: sleep 120
 
@@ -20,11 +22,13 @@ jobs:
         run: |
           # Logic to find the filename based on the tag
           VERSION=${GITHUB_REF#refs/tags/}
-          # Note: OBS release numbers (e.g. 8.1) change, so we might need a wildcard download
-          wget -r -l1 -nd -A "zypperx-$VERSION-*.noarch.rpm" https://download.opensuse.org/repositories/home:/itachi_re/openSUSE_Tumbleweed/noarch/
+          # Create directory to store downloads
+          mkdir -p downloads
+          # Download matching RPMs
+          wget -r -l1 -nd -A "zypperx-$VERSION-*.noarch.rpm" -P downloads "https://download.opensuse.org/repositories/home:/itachi_re/openSUSE_Tumbleweed/noarch/"
 
       # 3. Upload to GitHub Release
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
         with:
-          files: *.rpm
+          files: downloads/*.rpm
