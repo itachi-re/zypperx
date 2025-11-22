@@ -19,7 +19,7 @@ Summary:        A blazingly fast parallel wrapper for zypper
 License:        MIT
 Group:          System/Packages
 URL:            https://github.com/itachi-re/zypperx
-Source:         %{name}-%{version}.tar.gz
+Source:         %{name}-%{version}.tar.zst
 BuildRequires:  python3-base
 BuildRequires:  python-rpm-macros
 # Runtime dependencies (Tumbleweed automatically pulls python3-rich)
