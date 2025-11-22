@@ -27,7 +27,7 @@ from rich.panel import Panel
 # Constants
 ZYPPER_PID_FILE = "/run/zypp.pid"
 ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
-VERSION = "2.1.0-beta"
+VERSION = "0.0.2"
 
 class ExitCode:
     SUCCESS = 0
