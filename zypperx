@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
+# ZypperX - An enhanced parallel wrapper for zypper
+# Inspired by zypperoni (C) 2024 Pavin Joseph
+
+import os
+import sys
+import asyncio
+import shutil
+import tempfile
+import subprocess
+import argparse
+import signal
+import logging
+import fcntl
+import re
+import xml.etree.ElementTree as ET
+from contextlib import asynccontextmanager
+from uuid import uuid4
+from typing import List, Tuple, Optional, Set
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
+from rich.logging import RichHandler
+from rich.prompt import Confirm
+from rich.panel import Panel
+
+# Constants
+ZYPPER_PID_FILE = "/run/zypp.pid"
+ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
+VERSION = "2.1.0-beta"
+
+class ExitCode:
+    SUCCESS = 0
+    ERROR = 1
+    LOCKED = 5
+    PERMISSION_DENIED = 126
+
+# Setup Rich Console
+console = Console()
+logging.basicConfig(
+    level="INFO",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, markup=True, show_path=False)]
+)
+log = logging.getLogger("zypperx")
+
+class ZypperXEngine:
+    def __init__(self, jobs: int = 10, force: bool = False):
+        self.jobs = jobs
+        self.force = force
+        self.temp_root: Optional[str] = None
+        self.lock_fd: Optional[int] = None
+        # Semaphore to control concurrency
+        self.sem = asyncio.Semaphore(jobs)
+        self.shutting_down = False
+
+    def check_prerequisites(self):
+        """Checks for root and system dependencies."""
+        if os.geteuid() != 0:
+            console.print("[bold red]Error:[/bold red] ZypperX must be run as root (sudo).")
+            sys.exit(ExitCode.ERROR)
+
+        # Check dependencies
+        required = ["zypper", "mount", "umount", "chroot", "findmnt"]
+        missing = [prog for prog in required if shutil.which(prog) is None]
+        if missing:
+            console.print(f"[bold red]Error:[/bold red] Missing system tools: {', '.join(missing)}")
+            sys.exit(ExitCode.ERROR)
+
+    def get_lock(self):
+        """Acquire exclusive lock using fcntl (Atomic)."""
+        try:
+            # Open file for writing, create if not exists
+            self.lock_fd = os.open(ZYPPER_PID_FILE, os.O_CREAT | os.O_WRONLY, 0o644)
+            # Try to acquire an exclusive lock, non-blocking
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Truncate and write PID
+            os.ftruncate(self.lock_fd, 0)
+            os.write(self.lock_fd, str(os.getpid()).encode())
+        except BlockingIOError:
+            # Lock is held by another process
+            try:
+                with open(ZYPPER_PID_FILE, 'r') as f:
+                    pid = f.read().strip()
+                cmd = subprocess.getoutput(f"ps -p {pid} -o comm=") if pid and os.path.exists(f"/proc/{pid}") else "unknown"
+                console.print(f"[bold red]Error:[/bold red] Zypper is currently locked by PID {pid} ({cmd}).")
+            except Exception:
+                console.print("[bold red]Error:[/bold red] Zypper is currently locked.")
+            sys.exit(ExitCode.LOCKED)
+        except OSError as e:
+            console.print(f"[bold red]Error:[/bold red] Could not acquire lock: {e}")
+            sys.exit(ExitCode.ERROR)
+
+    def release_lock(self):
+        """Release the lock safely."""
+        if self.lock_fd is not None:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+                os.close(self.lock_fd)
+                self.lock_fd = None
+            except OSError as e:
+                log.error(f"Error releasing lock: {e}")
+
+    def setup_signal_handlers(self):
+        """Setup graceful shutdown for SIGINT/SIGTERM."""
+        def signal_handler(signum, frame):
+            if self.shutting_down:
+                return
+            self.shutting_down = True
+            log.warning("\n[bold yellow]Received signal, cleaning up...[/bold yellow]")
+            # We can't await async functions in a signal handler easily,
+            # but cleanup is robust enough to run if we exit or via finalizers.
+            # Here we force a quick cleanup attempt.
+            asyncio.create_task(self.cleanup())
+            # Give it a moment to clean up then exit
+            sys.exit(ExitCode.ERROR)
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+    @asynccontextmanager
+    async def safe_environment(self):
+        """Context Manager for the temporary workspace."""
+        self.setup_signal_handlers()
+        self.temp_root = tempfile.mkdtemp(prefix="zypperx_")
+        log.debug(f"Workspace: {self.temp_root}")
+
+        try:
+            self.get_lock()
+            yield self.temp_root
+        finally:
+            await self.cleanup()
+
+    def get_mounts_under(self, path: str) -> List[str]:
+        """Get all mounts under a path efficiently reading /proc/mounts."""
+        mounts = []
+        try:
+            with open('/proc/mounts', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mount_point = parts[1]
+                        if mount_point.startswith(path):
+                            mounts.append(mount_point)
+        except IOError as e:
+            log.error(f"Failed to read /proc/mounts: {e}")
+        # Sort reverse to unmount deepest first
+        return sorted(mounts, reverse=True)
+
+    async def cleanup(self):
+        """Aggressive cleanup of mounts and temp files."""
+        if self.temp_root and os.path.exists(self.temp_root):
+            log.debug("Cleaning up resources...")
+
+            # 1. Unmount everything safely
+            mounts = self.get_mounts_under(self.temp_root)
+            for mount in mounts:
+                subprocess.run(
+                    ['umount', '-l', mount],
+                    stderr=subprocess.DEVNULL,
+                    check=False
+                )
+
+            # 2. Remove directory
+            try:
+                shutil.rmtree(self.temp_root, ignore_errors=True)
+            except Exception as e:
+                log.error(f"Failed to remove temp dir: {e}")
+
+        self.release_lock()
+        log.debug("Cleanup complete.")
+
+    async def cleanup_worker(self, worker_root: str):
+        """Specific cleanup for a single worker path."""
+        mounts = self.get_mounts_under(worker_root)
+        for mount in mounts:
+            subprocess.run(
+                ['umount', '-l', mount],
+                stderr=subprocess.DEVNULL,
+                check=False
+            )
+
+    def copy_resolv_conf(self, worker_root: str):
+        """Safely copy resolv.conf preventing symlink attacks."""
+        resolv_src = "/etc/resolv.conf"
+
+        # Determine destination path logic
+        # If the src is a link, we need to respect where it points inside the chroot
+        # or fallback to a simple file copy if the link target is suspicious.
+
+        if os.path.islink(resolv_src):
+            try:
+                real_path = os.path.realpath(resolv_src)
+                # Validate target is in safe system paths
+                if not (real_path.startswith('/etc') or real_path.startswith('/run')):
+                    log.warning(f"Suspicious resolv.conf target: {real_path}. Using fallback copy.")
+                    shutil.copy(resolv_src, os.path.join(worker_root, "etc/resolv.conf"))
+                    return
+
+                # Recreate the link structure inside chroot
+                # e.g. /run/netconfig/resolv.conf -> $CHROOT/run/netconfig/resolv.conf
+                target_in_chroot = os.path.join(worker_root, real_path.lstrip('/'))
+                os.makedirs(os.path.dirname(target_in_chroot), exist_ok=True)
+
+                # Remove existing symlink or file if any
+                dest_link = os.path.join(worker_root, "etc/resolv.conf")
+                if os.path.exists(dest_link) or os.path.islink(dest_link):
+                    os.unlink(dest_link)
+
+                # Create the file at the target location
+                shutil.copy(resolv_src, target_in_chroot)
+                # Create the symlink at /etc/resolv.conf
+                os.symlink(real_path, dest_link)
+            except Exception as e:
+                log.warning(f"Error handling resolv.conf symlink: {e}. Falling back to copy.")
+                shutil.copy(resolv_src, os.path.join(worker_root, "etc/resolv.conf"))
+        else:
+            shutil.copy(resolv_src, os.path.join(worker_root, "etc/resolv.conf"))
+
+    async def mount_with_retry(self, src: str, dest: str, flags: List[str], max_retries: int = 3):
+        """Mount with retry logic to handle transient busy states."""
+        for attempt in range(max_retries):
+            cmd = ["mount"] + flags + [src, dest]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                return True
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.1 * (attempt + 1))
+
+        log.error(f"Failed to mount {src} to {dest}: {result.stderr.strip()}")
+        return False
+
+    async def prepare_chroot(self, worker_uuid: str) -> str:
+        """Creates a functional chroot environment."""
+        worker_root = os.path.join(self.temp_root, worker_uuid, "rootfs")
+
+        # Create structure
+        for d in ["run", "tmp", "dev", "var/cache/zypp", "var/lib/ca-certificates", "etc"]:
+            os.makedirs(os.path.join(worker_root, d), exist_ok=True)
+
+        self.copy_resolv_conf(worker_root)
+
+        # Mounts
+        mounts = [
+            ("/", worker_root, ["--bind", "-o", "ro"]), # Read-only root
+            ("/dev", os.path.join(worker_root, "dev"), ["--bind"]),
+            ("tmpfs", os.path.join(worker_root, "tmp"), ["-t", "tmpfs"]),
+            ("/run", os.path.join(worker_root, "run"), ["--bind"]),
+            ("/var", os.path.join(worker_root, "var"), ["--bind"]),
+            ("/var/cache/zypp", os.path.join(worker_root, "var/cache/zypp"), ["--bind"]),
+            ("/var/lib/ca-certificates", os.path.join(worker_root, "var/lib/ca-certificates"), ["--bind", "-o", "ro"]),
+        ]
+
+        for src, dest, flags in mounts:
+            if not await self.mount_with_retry(src, dest, flags):
+                raise RuntimeError(f"Failed to mount {src}")
+
+        return worker_root
+
+    async def _run_zypper_in_chroot(self, chroot_path: str, args: List[str]) -> Tuple[int, bytes, bytes]:
+        """Helper to run the command inside the chroot."""
+        cmd = ["chroot", chroot_path, "env", "-i"]
+        for k, v in ZYPPER_ENV.items():
+            cmd.append(f"{k}={v}")
+
+        cmd.extend(["zypper", "--non-interactive"] + args)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        return proc.returncode, stdout, stderr
+
+    def validate_input(self, item: str) -> bool:
+        """Validate package name or repo alias to prevent injection/errors."""
+        # Allow alphanumeric, dots, dashes, underscores, pluses, colons (for repos)
+        if not re.match(r'^[\w\.\-\+\:]+$', item):
+            log.warning(f"Skipping suspicious input item: {item}")
+            return False
+        return True
+
+    async def execute_tasks(self, task_list: List[str], task_type: str, description: str):
+        """Generic executor for parallel tasks."""
+
+        # Pre-filter tasks
+        valid_tasks = [t for t in task_list if self.validate_input(t)]
+        if len(valid_tasks) < len(task_list):
+            log.warning(f"Removed {len(task_list) - len(valid_tasks)} invalid/suspicious items.")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=console
+        ) as progress:
+
+            main_task = progress.add_task(description, total=len(valid_tasks))
+
+            async def worker(item):
+                async with self.sem:
+                    worker_uuid = str(uuid4())
+                    root_path = None
+                    try:
+                        root_path = await self.prepare_chroot(worker_uuid)
+
+                        if task_type == "refresh":
+                            cmd_args = ["refresh", "--force"] if self.force else ["refresh"]
+                            cmd_args.append(item)
+                        elif task_type == "download":
+                            cmd_args = ["download", item]
+
+                        code, out, err = await self._run_zypper_in_chroot(root_path, cmd_args)
+
+                        if code != 0:
+                            log.error(f"Failed to process {item}. Code: {code}")
+                            log.debug(f"Stderr: {err.decode()}")
+                    except Exception as e:
+                        log.error(f"Exception in worker for {item}: {e}")
+                    finally:
+                        progress.advance(main_task)
+                        if root_path:
+                            await self.cleanup_worker(root_path)
+
+            await asyncio.gather(*[worker(item) for item in valid_tasks])
+
+    # --- Logic parsers ---
+
+    def get_enabled_repos(self) -> List[str]:
+        """Parses 'zypper repos' XML to find enabled repositories."""
+        console.print("[cyan]Scanning enabled repositories...[/cyan]")
+        cmd = ["env", "-i"] + [f"{k}={v}" for k,v in ZYPPER_ENV.items()] + \
+              ["zypper", "--non-interactive", "--no-cd", "--xmlout", "repos"]
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            console.print("[bold red]Failed to list repositories.[/bold red]")
+            sys.exit(ExitCode.ERROR)
+
+        try:
+            root = ET.fromstring(res.stdout)
+            repos = [r.attrib['alias'] for r in root.iter('repo') if r.attrib.get('enabled') == '1']
+            return repos
+        except ET.ParseError:
+            console.print("[bold red]Failed to parse zypper output.[/bold red]")
+            sys.exit(ExitCode.ERROR)
+
+    def get_transaction_packages(self, mode: str, packages: List[str] = None) -> Tuple[List[str], int]:
+        """Runs dry-run and parses XML for download list."""
+        console.print(f"[cyan]Calculating transaction for {mode}...[/cyan]")
+
+        base_cmd = ["env", "-i"] + [f"{k}={v}" for k,v in ZYPPER_ENV.items()] + \
+                   ["zypper", "--non-interactive", "--no-cd", "--xmlout"]
+
+        if mode == "dist-upgrade":
+            cmd = base_cmd + ["dist-upgrade", "--dry-run"]
+        elif mode == "install":
+            cmd = base_cmd + ["install", "--dry-run"] + (packages or [])
+        elif mode == "install-new-recommends":
+            cmd = base_cmd + ["install-new-recommends", "--dry-run"]
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+
+        if "Nothing to do" in res.stdout or (res.returncode == 0 and "install-summary" not in res.stdout):
+             return [], 0
+
+        try:
+            root = ET.fromstring(res.stdout)
+
+            summary = root.find(".//install-summary")
+            if summary is None:
+                msgs = [m.text for m in root.iter("message") if m.text]
+                if msgs:
+                    console.print(Panel("\n".join(msgs), title="Zypper Solver Message", border_style="yellow"))
+                return [], 0
+
+            download_size = int(summary.attrib.get("download-size", 0))
+
+            to_install = []
+            for solv in root.iter("solvable"):
+                if solv.attrib.get("type") == "package":
+                    pkg_str = f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}"
+                    to_install.append(pkg_str)
+
+            to_remove = []
+            for rm in root.iter("to-remove"):
+                for solv in rm.findall("solvable"):
+                     to_remove.append(f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}")
+
+            final_list = list(set(to_install) - set(to_remove))
+            final_list.sort()
+            return final_list, download_size
+
+        except ET.ParseError:
+            console.print("[bold red]Failed to parse transaction XML.[/bold red]")
+            sys.exit(ExitCode.ERROR)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="ZypperX - Parallel Accelerator for Zypper")
+    parser.add_argument("-j", "--jobs", type=int, default=10, help="Number of parallel jobs")
+    parser.add_argument("-y", "--no-confirm", action="store_true", help="Auto-confirm prompts")
+    parser.add_argument("--version", action="store_true", help="Show version")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Refresh
+    p_ref = subparsers.add_parser("refresh", aliases=["ref"])
+    p_ref.add_argument("-f", "--force", action="store_true", help="Force refresh")
+
+    # DUP
+    p_dup = subparsers.add_parser("dist-upgrade", aliases=["dup"])
+    p_dup.add_argument("-d", "--download-only", action="store_true")
+
+    # Install
+    p_in = subparsers.add_parser("install", aliases=["in"])
+    p_in.add_argument("packages", nargs="+")
+    p_in.add_argument("-d", "--download-only", action="store_true")
+
+    # INR
+    p_inr = subparsers.add_parser("install-new-recommends", aliases=["inr"])
+    p_inr.add_argument("-d", "--download-only", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.version:
+        console.print(f"ZypperX v{VERSION}")
+        return
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    engine = ZypperXEngine(jobs=args.jobs, force=getattr(args, 'force', False))
+    engine.check_prerequisites()
+
+    # Logic routing
+    async with engine.safe_environment():
+
+        # --- REFRESH ---
+        if args.command in ["refresh", "ref"]:
+            repos = engine.get_enabled_repos()
+            if not repos:
+                console.print("No enabled repositories found.")
+                return
+
+            console.print(f"[green]Refreshing {len(repos)} repositories with {args.jobs} jobs...[/green]")
+            await engine.execute_tasks(repos, "refresh", "[cyan]Refreshing repos...")
+            console.print("[bold green]Refresh complete.[/bold green]")
+
+        # --- INSTALL / DUP / INR ---
+        elif args.command in ["dist-upgrade", "dup", "install", "in", "install-new-recommends", "inr"]:
+
+            mode = "dist-upgrade" if args.command in ["dist-upgrade", "dup"] else \
+                   "install" if args.command in ["install", "in"] else \
+                   "install-new-recommends"
+
+            target_pkgs = getattr(args, "packages", [])
+
+            pkgs_to_download, size = engine.get_transaction_packages(mode, target_pkgs)
+
+            if not pkgs_to_download:
+                console.print("[green]Nothing to do.[/green]")
+                return
+
+            # Check if already cached
+            if size == 0:
+                console.print("[green]All packages already in cache.[/green]")
+            else:
+                size_mb = size / (1024 * 1024)
+                console.print(Panel(
+                    f"Packages: [bold]{len(pkgs_to_download)}[/bold]\nDownload Size: [bold]{size_mb:.2f} MB[/bold]",
+                    title="Transaction Summary",
+                    expand=False
+                ))
+
+                if not args.no_confirm:
+                    if not Confirm.ask("Proceed with download?"):
+                        sys.exit(0)
+
+                await engine.execute_tasks(pkgs_to_download, "download", "[cyan]Downloading packages...")
+
+            # Final Handover
+            if not getattr(args, 'download_only', False):
+                console.print("\n[bold yellow]>> Handing over to actual Zypper for installation...[/bold yellow]")
+
+                final_cmd = ["zypper"]
+                if args.no_confirm: final_cmd.append("--non-interactive")
+                final_cmd.append("--no-cd")
+
+                if mode == "dist-upgrade": final_cmd.append("dist-upgrade")
+                elif mode == "install-new-recommends": final_cmd.append("install-new-recommends")
+                elif mode == "install": final_cmd.extend(["install"] + target_pkgs)
+
+                engine.release_lock()
+
+                env = os.environ.copy()
+                env.update(ZYPPER_ENV)
+
+                os.execvpe("zypper", final_cmd, env)
+            else:
+                console.print("[bold green]Download complete.[/bold green]")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass # Context manager handles cleanup
