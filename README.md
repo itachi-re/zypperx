@@ -2,10 +2,10 @@
 
 <div align="center">
 
-[![OBS Package](https://img.shields.io/badge/OBS-home:itachi_re-blue?style=for-the-badge&logo=opensuse)](https://build.opensuse.org/package/show/home:itachi_re/zypperx)
-[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python)](https://python.org)
-[![openSUSE](https://img.shields.io/badge/openSUSE-Tumbleweed%20%26%20Leap-green?style=for-the-badge&logo=opensuse)](https://opensuse.org)
+[![build result](https://build.opensuse.org/projects/home:itachi_re/packages/zypperx/badge.svg?type=default)](https://build.opensuse.org/package/show/home:itachi_re/zypperx)
+[![License](https://img.shields.io/badge/License-GPLv3-red.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)](https://python.org)
+[![openSUSE](https://img.shields.io/badge/openSUSE-Tumbleweed%20%26%20Leap-green?logo=opensuse)](https://opensuse.org)
 
 **Parallel Package Downloads for openSUSE's Zypper**
 
