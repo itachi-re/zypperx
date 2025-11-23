@@ -16,7 +16,7 @@ Name:           zypperx
 Version:        0.0.0
 Release:        0
 Summary:        A blazingly fast parallel wrapper for zypper
-License:        MIT
+License:        GPL-3.0-or-later
 Group:          System/Packages
 URL:            https://github.com/itachi-re/zypperx
 Source:         %{name}-%{version}.tar.zst
@@ -53,7 +53,10 @@ sed -i 's|#!/usr/bin/env python3|#!/usr/bin/python3|' %{buildroot}%{_bindir}/zyp
 %{_bindir}/zypperx
 
 %changelog
-* Sat Nov 22 2025 itachi_re <xanbenson99@gmail.com> - 0.0.2-0
-- Initial package release
-- Implemented parallel download with chroot isolation
-- Added atomic locking and signal handling
+* Mon Nov 24 2025 itachi_re <xanbenson99@gmail.com> - 0.0.5-0
+- Update to GPLv3 license
+- Fix critical network issues in chroot (DNS resolution)
+- Add bind mounts for /etc/ssl and certificates
+- Implement tmpfs for /run to securely hide lock file
+* Sat Nov 22 2025 itachi_re <xanbenson99@gmail.com> - 0.0.3-0
+- Fix deadlock: Move transaction calculation outside of locked scope

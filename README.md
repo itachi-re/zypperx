@@ -3,7 +3,7 @@
 <div align="center">
 
 [![OBS Package](https://img.shields.io/badge/OBS-home:itachi_re-blue?style=for-the-badge&logo=opensuse)](https://build.opensuse.org/package/show/home:itachi_re/zypperx)
-[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python)](https://python.org)
 [![openSUSE](https://img.shields.io/badge/openSUSE-Tumbleweed%20%26%20Leap-green?style=for-the-badge&logo=opensuse)](https://opensuse.org)
 
@@ -545,10 +545,10 @@ Open an issue with:
 
 ## 📄 License
 
-Distributed under the MIT License. See [`LICENSE`](LICENSE) for full text.
+Distributed under the GPLv3 License. See [`LICENSE`](LICENSE) for full text.
 
 ```
-MIT License
+GPLv3 License
 
 Copyright (c) 2025 itachi_re
 
