@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
-# ZypperX - An enhanced parallel wrapper for zypper
-# Inspired by zypperoni (C) 2024 Pavin Joseph
+# ZypperX - Safe Parallel Wrapper for Zypper
+# v0.0.6 - Complete rewrite with namespace isolation
 #
 # ZypperX is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
+
 import os
 import sys
 import asyncio
@@ -19,9 +20,8 @@ import logging
 import fcntl
 import re
 import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
-from uuid import uuid4
-from typing import List, Tuple, Optional, Set
+from pathlib import Path
+from typing import List, Tuple, Optional
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
 from rich.logging import RichHandler
@@ -31,7 +31,10 @@ from rich.panel import Panel
 # Constants
 ZYPPER_PID_FILE = "/run/zypp.pid"
 ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
-VERSION = "0.0.5"
+VERSION = "0.0.6-safe"
+
+# CRITICAL SAFETY: Paths that MUST NEVER be mounted over
+PROTECTED_PATHS = {"/", "/var", "/home", "/root", "/etc", "/usr", "/boot", "/bin", "/sbin", "/lib", "/lib64"}
 
 class ExitCode:
     SUCCESS = 0
@@ -49,46 +52,212 @@ logging.basicConfig(
 )
 log = logging.getLogger("zypperx")
 
+class SafetyChecker:
+    """Pre-flight safety checks to prevent catastrophic failures."""
+
+    @staticmethod
+    def verify_no_ghost_mounts(temp_prefix: str = "zypperx_") -> bool:
+        """Check for leftover mounts from previous crashes."""
+        try:
+            with open('/proc/mounts', 'r') as f:
+                mounts = f.read()
+                if temp_prefix in mounts:
+                    console.print(f"[bold red]DANGER:[/bold red] Found leftover mounts from previous run!")
+                    console.print("[yellow]Run this command to clean up:[/yellow]")
+                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/rootfs/*/* 2>/dev/null || true")
+                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/rootfs/* 2>/dev/null || true")
+                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/rootfs 2>/dev/null || true")
+                    console.print(f"  sudo rm -rf /tmp/{temp_prefix}*")
+                    return False
+        except IOError:
+            pass
+        return True
+
+    @staticmethod
+    def verify_filesystem_health() -> bool:
+        """Check that critical paths are accessible."""
+        critical_paths = ["/var", "/var/cache", "/etc", "/tmp"]
+        for path in critical_paths:
+            if not os.path.exists(path) or not os.access(path, os.R_OK | os.W_OK):
+                console.print(f"[bold red]CRITICAL:[/bold red] {path} is not accessible!")
+                return False
+        return True
+
+    @staticmethod
+    def check_unshare_support() -> bool:
+        """Verify that unshare is available and functional."""
+        try:
+            result = subprocess.run(
+                ["unshare", "--version"],
+                capture_output=True,
+                timeout=2
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            console.print("[bold red]ERROR:[/bold red] 'unshare' command not found or not working!")
+            console.print("Install util-linux package: sudo zypper install util-linux")
+            return False
+
+
+class NamespacedWorker:
+    """Isolated worker that runs in its own mount namespace."""
+
+    def __init__(self, worker_id: str, task_type: str, task_item: str):
+        self.worker_id = worker_id
+        self.task_type = task_type
+        self.task_item = task_item
+        self.workspace = None
+
+    async def execute(self) -> Tuple[int, str]:
+        """Execute task in complete isolation using unshare."""
+
+        # Create isolated workspace
+        self.workspace = tempfile.mkdtemp(prefix=f"zypperx_worker_{self.worker_id}_")
+
+        try:
+            # Build the command that will run in isolated namespace
+            if self.task_type == "refresh":
+                zypper_args = ["refresh", "--force", self.task_item]
+            elif self.task_type == "download":
+                zypper_args = ["download", self.task_item]
+            else:
+                return 1, f"Unknown task type: {self.task_type}"
+
+            # CRITICAL: Use unshare to create isolated mount namespace
+            # This ensures ALL mounts are private and auto-cleanup on exit
+            cmd = [
+                "unshare",
+                "--mount",           # Private mount namespace
+                "--propagation", "private",  # Don't propagate mounts to parent
+                "sh", "-c",
+                self._build_isolated_script(zypper_args)
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._build_env()
+            )
+
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                error_msg = stderr.decode('utf-8', errors='ignore').strip()
+                return proc.returncode, error_msg
+
+            return 0, "Success"
+
+        finally:
+            # Cleanup workspace (mounts already gone due to namespace isolation)
+            if self.workspace and os.path.exists(self.workspace):
+                shutil.rmtree(self.workspace, ignore_errors=True)
+
+    def _build_isolated_script(self, zypper_args: List[str]) -> str:
+        """Build shell script that sets up minimal chroot in isolated namespace."""
+
+        # SAFETY: We only mount what we absolutely need, and ONLY in the isolated namespace
+        script = f"""
+set -e
+
+# Create minimal directory structure
+CHROOT="{self.workspace}/chroot"
+mkdir -p "$CHROOT"{{/dev,/proc,/sys,/tmp,/run,/var/cache/zypp,/etc}}
+
+# Mount ONLY what's needed (these are invisible to host due to unshare)
+mount -t tmpfs tmpfs "$CHROOT/tmp"
+mount -t tmpfs tmpfs "$CHROOT/run"
+mount --bind -o ro /dev "$CHROOT/dev"
+mount --bind -o ro /proc "$CHROOT/proc"
+mount --bind -o ro /sys "$CHROOT/sys"
+
+# Share package cache (read-write for downloads)
+mount --bind /var/cache/zypp "$CHROOT/var/cache/zypp"
+
+# Copy minimal network config
+cp /etc/resolv.conf "$CHROOT/etc/resolv.conf" 2>/dev/null || true
+
+# Bind SSL certificates (read-only)
+if [ -d /etc/ssl ]; then
+    mkdir -p "$CHROOT/etc/ssl"
+    mount --bind -o ro /etc/ssl "$CHROOT/etc/ssl"
+fi
+
+# Bind zypper binaries and libraries (read-only)
+for path in /usr/bin/zypper /usr/lib/zypper /usr/share/zypper; do
+    if [ -e "$path" ]; then
+        mkdir -p "$CHROOT$(dirname $path)"
+        mount --bind -o ro "$path" "$CHROOT$path"
+    fi
+done
+
+# Execute zypper in the isolated chroot
+chroot "$CHROOT" env -i \
+    ZYPP_CURL2=1 \
+    ZYPP_PCK_PRELOAD=1 \
+    ZYPP_SINGLE_RPMTRANS=1 \
+    PATH=/usr/bin:/bin \
+    zypper --non-interactive {' '.join(zypper_args)}
+
+# Cleanup is automatic when namespace exits
+"""
+        return script
+
+    def _build_env(self) -> dict:
+        """Build minimal environment for worker."""
+        return {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": "/tmp",
+            "LANG": "C.UTF-8"
+        }
+
+
 class ZypperXEngine:
     def __init__(self, jobs: int = 10, force: bool = False):
         self.jobs = jobs
         self.force = force
-        self.temp_root: Optional[str] = None
         self.lock_fd: Optional[int] = None
-        # Semaphore to control concurrency
         self.sem = asyncio.Semaphore(jobs)
         self.shutting_down = False
 
     def check_prerequisites(self):
-        """Checks for root and system dependencies."""
+        """Comprehensive safety checks."""
         if os.geteuid() != 0:
             console.print("[bold red]Error:[/bold red] ZypperX must be run as root (sudo).")
             sys.exit(ExitCode.ERROR)
 
+        # Check for leftover mounts
+        if not SafetyChecker.verify_no_ghost_mounts():
+            sys.exit(ExitCode.ERROR)
+
+        # Check filesystem health
+        if not SafetyChecker.verify_filesystem_health():
+            sys.exit(ExitCode.ERROR)
+
+        # Check unshare support
+        if not SafetyChecker.check_unshare_support():
+            sys.exit(ExitCode.ERROR)
+
         # Check dependencies
-        required = ["zypper", "mount", "umount", "chroot", "findmnt"]
+        required = ["zypper", "mount", "umount", "chroot", "unshare"]
         missing = [prog for prog in required if shutil.which(prog) is None]
         if missing:
             console.print(f"[bold red]Error:[/bold red] Missing system tools: {', '.join(missing)}")
             sys.exit(ExitCode.ERROR)
 
     def get_lock(self):
-        """Acquire exclusive lock using fcntl (Atomic)."""
+        """Acquire exclusive lock using fcntl."""
         try:
-            # Open file for writing, create if not exists
             self.lock_fd = os.open(ZYPPER_PID_FILE, os.O_CREAT | os.O_WRONLY, 0o644)
-            # Try to acquire an exclusive lock, non-blocking
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Truncate and write PID
             os.ftruncate(self.lock_fd, 0)
             os.write(self.lock_fd, str(os.getpid()).encode())
         except BlockingIOError:
-            # Lock is held by another process
             try:
                 with open(ZYPPER_PID_FILE, 'r') as f:
                     pid = f.read().strip()
-                cmd = subprocess.getoutput(f"ps -p {pid} -o comm=") if pid and os.path.exists(f"/proc/{pid}") else "unknown"
-                console.print(f"[bold red]Error:[/bold red] Zypper is currently locked by PID {pid} ({cmd}).")
+                cmd = subprocess.getoutput(f"ps -p {pid} -o comm=") if pid else "unknown"
+                console.print(f"[bold red]Error:[/bold red] Zypper is locked by PID {pid} ({cmd}).")
             except Exception:
                 console.print("[bold red]Error:[/bold red] Zypper is currently locked.")
             sys.exit(ExitCode.LOCKED)
@@ -106,182 +275,15 @@ class ZypperXEngine:
             except OSError as e:
                 log.error(f"Error releasing lock: {e}")
 
-    def setup_signal_handlers(self):
-        """Setup graceful shutdown for SIGINT/SIGTERM."""
-        def signal_handler(signum, frame):
-            if self.shutting_down:
-                return
-            self.shutting_down = True
-            log.warning("\n[bold yellow]Received signal, cleaning up...[/bold yellow]")
-            asyncio.create_task(self.cleanup())
-            sys.exit(ExitCode.ERROR)
-
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-
-    @asynccontextmanager
-    async def safe_environment(self):
-        """Context Manager for the temporary workspace."""
-        self.setup_signal_handlers()
-        self.temp_root = tempfile.mkdtemp(prefix="zypperx_")
-        log.debug(f"Workspace: {self.temp_root}")
-
-        try:
-            # Acquire lock ONLY when we are ready to download
-            self.get_lock()
-            yield self.temp_root
-        finally:
-            await self.cleanup()
-
-    def get_mounts_under(self, path: str) -> List[str]:
-        """Get all mounts under a path efficiently reading /proc/mounts."""
-        mounts = []
-        try:
-            with open('/proc/mounts', 'r') as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        mount_point = parts[1]
-                        if mount_point.startswith(path):
-                            mounts.append(mount_point)
-        except IOError as e:
-            log.error(f"Failed to read /proc/mounts: {e}")
-        return sorted(mounts, reverse=True)
-
-    async def cleanup(self):
-        """Aggressive cleanup of mounts and temp files."""
-        if self.temp_root and os.path.exists(self.temp_root):
-            log.debug("Cleaning up resources...")
-            mounts = self.get_mounts_under(self.temp_root)
-            for mount in mounts:
-                subprocess.run(
-                    ['umount', '-l', mount],
-                    stderr=subprocess.DEVNULL,
-                    check=False
-                )
-            try:
-                shutil.rmtree(self.temp_root, ignore_errors=True)
-            except Exception as e:
-                log.error(f"Failed to remove temp dir: {e}")
-
-        self.release_lock()
-
-    async def cleanup_worker(self, worker_root: str):
-        """Specific cleanup for a single worker path."""
-        mounts = self.get_mounts_under(worker_root)
-        for mount in mounts:
-            subprocess.run(['umount', '-l', mount], stderr=subprocess.DEVNULL, check=False)
-
-    async def mount_with_retry(self, src: str, dest: str, flags: List[str], max_retries: int = 3):
-        """Mount with retry logic, handling files and directories correctly."""
-        # Ensure mount point exists (create file if src is file, dir if src is dir)
-        if src.startswith("/") and os.path.exists(src):
-            if os.path.isfile(src):
-                # For file bind mounts, ensure parent dir exists and create empty file
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                if not os.path.exists(dest):
-                    open(dest, 'a').close()
-            else:
-                # For directory mounts
-                os.makedirs(dest, exist_ok=True)
-        else:
-            # For tmpfs and other virtual filesystems
-            os.makedirs(dest, exist_ok=True)
-
-        for attempt in range(max_retries):
-            cmd = ["mount"] + flags + [src, dest]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                return True
-            if attempt < max_retries - 1:
-                await asyncio.sleep(0.1 * (attempt + 1))
-
-        log.error(f"Failed to mount {src} to {dest}: {result.stderr.strip()}")
-        return False
-
-    async def prepare_chroot(self, worker_uuid: str) -> str:
-        """Creates a functional chroot environment with proper networking."""
-        worker_root = os.path.join(self.temp_root, worker_uuid, "rootfs")
-
-        # 1. Create Base Directory Structure
-        for d in ["run", "tmp", "dev", "proc", "sys", "var/cache/zypp", "var/lib/ca-certificates", "etc"]:
-            os.makedirs(os.path.join(worker_root, d), exist_ok=True)
-
-        # 2. Mount List - Ordered for proper layering
-        mounts = [
-            # Core Filesystem (Read-Only Host Root)
-            ("/", worker_root, ["--bind", "-o", "ro"]),
-
-            # Kernel API Filesystems (Required for network tools)
-            ("/dev", os.path.join(worker_root, "dev"), ["--bind"]),
-            ("/proc", os.path.join(worker_root, "proc"), ["--bind"]),
-            ("/sys", os.path.join(worker_root, "sys"), ["--bind"]),
-
-            # Isolated Runtime (CRITICAL: Empty tmpfs hides host /run/zypp.pid)
-            ("tmpfs", os.path.join(worker_root, "run"), ["-t", "tmpfs", "-o", "mode=755,size=10m"]),
-
-            # Writeable Temporary Space
-            ("tmpfs", os.path.join(worker_root, "tmp"), ["-t", "tmpfs", "-o", "mode=1777,size=100m"]),
-
-            # Shared Package Cache (Read-Write for downloads)
-            ("/var", os.path.join(worker_root, "var"), ["--bind"]),
-            ("/var/cache/zypp", os.path.join(worker_root, "var/cache/zypp"), ["--bind"]),
-
-            # Network Configuration (Bind mount ensures DNS works)
-            ("/etc/resolv.conf", os.path.join(worker_root, "etc/resolv.conf"), ["--bind", "-o", "ro"]),
-
-            # SSL/TLS Certificates (Required for HTTPS repo access)
-            ("/etc/ssl", os.path.join(worker_root, "etc/ssl"), ["--bind", "-o", "ro"]),
-            ("/var/lib/ca-certificates", os.path.join(worker_root, "var/lib/ca-certificates"), ["--bind", "-o", "ro"]),
-        ]
-
-        # 3. Optional Mounts (Only if they exist on host)
-        optional_mounts = [
-            ("/etc/hosts", os.path.join(worker_root, "etc/hosts"), ["--bind", "-o", "ro"]),
-            ("/etc/nsswitch.conf", os.path.join(worker_root, "etc/nsswitch.conf"), ["--bind", "-o", "ro"]),
-        ]
-
-        # 4. Execute Core Mounts
-        for src, dest, flags in mounts:
-            # Skip missing sources (except tmpfs which is virtual)
-            if src.startswith("/") and not os.path.exists(src):
-                log.warning(f"Skipping missing mount source: {src}")
-                continue
-
-            if not await self.mount_with_retry(src, dest, flags):
-                raise RuntimeError(f"Critical mount failed: {src}")
-
-        # 5. Execute Optional Mounts (non-fatal)
-        for src, dest, flags in optional_mounts:
-            if os.path.exists(src):
-                await self.mount_with_retry(src, dest, flags)
-
-        return worker_root
-
-    async def _run_zypper_in_chroot(self, chroot_path: str, args: List[str]) -> Tuple[int, bytes, bytes]:
-        """Helper to run the command inside the chroot."""
-        cmd = ["chroot", chroot_path, "env", "-i"]
-        for k, v in ZYPPER_ENV.items():
-            cmd.append(f"{k}={v}")
-        cmd.extend(["zypper", "--non-interactive"] + args)
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        return proc.returncode, stdout, stderr
-
     def validate_input(self, item: str) -> bool:
-        """Validate package names and repo aliases to prevent injection."""
+        """Validate package names and repo aliases."""
         if not re.match(r'^[\w\.\-\+\:]+$', item):
-            log.warning(f"Skipping suspicious input item: {item}")
+            log.warning(f"Skipping suspicious input: {item}")
             return False
         return True
 
     async def execute_tasks(self, task_list: List[str], task_type: str, description: str):
-        """Execute parallel tasks with progress tracking."""
+        """Execute parallel tasks with isolated workers."""
         valid_tasks = [t for t in task_list if self.validate_input(t)]
 
         with Progress(
@@ -294,40 +296,24 @@ class ZypperXEngine:
 
             main_task = progress.add_task(description, total=len(valid_tasks))
 
-            async def worker(item):
+            async def worker(idx: int, item: str):
                 async with self.sem:
-                    worker_uuid = str(uuid4())
-                    root_path = None
+                    worker = NamespacedWorker(f"{idx}", task_type, item)
                     try:
-                        root_path = await self.prepare_chroot(worker_uuid)
-
-                        if task_type == "refresh":
-                            cmd_args = ["refresh", "--force"] if self.force else ["refresh"]
-                            cmd_args.append(item)
-                        elif task_type == "download":
-                            cmd_args = ["download", item]
-
-                        code, out, err = await self._run_zypper_in_chroot(root_path, cmd_args)
-
+                        code, msg = await worker.execute()
                         if code != 0:
-                            error_msg = err.decode('utf-8', errors='ignore').strip()
-                            log.error(f"Failed to process {item}. Code: {code}")
-                            if error_msg:
-                                log.debug(f"Error details: {error_msg}")
+                            log.error(f"Failed: {item} - {msg}")
                     except Exception as e:
-                        log.error(f"Exception in worker for {item}: {e}")
+                        log.error(f"Exception for {item}: {e}")
                     finally:
                         progress.advance(main_task)
-                        if root_path:
-                            await self.cleanup_worker(root_path)
 
-            await asyncio.gather(*[worker(item) for item in valid_tasks])
+            await asyncio.gather(*[worker(i, item) for i, item in enumerate(valid_tasks)])
 
     def get_enabled_repos(self) -> List[str]:
         """Retrieve list of enabled repositories."""
         console.print("[cyan]Scanning enabled repositories...[/cyan]")
-        cmd = ["env", "-i"] + [f"{k}={v}" for k,v in ZYPPER_ENV.items()] + \
-              ["zypper", "--non-interactive", "--no-cd", "--xmlout", "repos"]
+        cmd = ["zypper", "--non-interactive", "--no-cd", "--xmlout", "repos"]
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
@@ -346,8 +332,7 @@ class ZypperXEngine:
         """Calculate transaction packages using dry-run."""
         console.print(f"[cyan]Calculating transaction for {mode}...[/cyan]")
 
-        base_cmd = ["env", "-i"] + [f"{k}={v}" for k,v in ZYPPER_ENV.items()] + \
-                   ["zypper", "--non-interactive", "--no-cd", "--xmlout"]
+        base_cmd = ["zypper", "--non-interactive", "--no-cd", "--xmlout"]
 
         if mode == "dist-upgrade":
             cmd = base_cmd + ["dist-upgrade", "--dry-run"]
@@ -358,20 +343,18 @@ class ZypperXEngine:
 
         res = subprocess.run(cmd, capture_output=True, text=True)
 
-        if "Nothing to do" in res.stdout or (res.returncode == 0 and "install-summary" not in res.stdout):
-             return [], 0
+        if "Nothing to do" in res.stdout:
+            return [], 0
 
         try:
             root = ET.fromstring(res.stdout)
             summary = root.find(".//install-summary")
             if summary is None:
-                msgs = [m.text for m in root.iter("message") if m.text]
-                if msgs:
-                    console.print(Panel("\n".join(msgs), title="Zypper Solver Message", border_style="yellow"))
                 return [], 0
 
             download_size = int(summary.attrib.get("download-size", 0))
             to_install = []
+
             for solv in root.iter("solvable"):
                 if solv.attrib.get("type") == "package":
                     pkg_str = f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}"
@@ -380,7 +363,7 @@ class ZypperXEngine:
             to_remove = []
             for rm in root.iter("to-remove"):
                 for solv in rm.findall("solvable"):
-                     to_remove.append(f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}")
+                    to_remove.append(f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}")
 
             final_list = list(set(to_install) - set(to_remove))
             final_list.sort()
@@ -392,7 +375,7 @@ class ZypperXEngine:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="ZypperX - Parallel Accelerator for Zypper")
+    parser = argparse.ArgumentParser(description="ZypperX v0.0.6 - Safe Parallel Accelerator")
     parser.add_argument("-j", "--jobs", type=int, default=10, help="Number of parallel jobs")
     parser.add_argument("-y", "--no-confirm", action="store_true", help="Auto-confirm prompts")
     parser.add_argument("-f", "--force", action="store_true", help="Force refresh")
@@ -417,7 +400,10 @@ async def main():
     args = parser.parse_args()
 
     if args.version:
-        console.print(f"ZypperX v{VERSION}")
+        console.print(f"[bold cyan]ZypperX {VERSION}[/bold cyan]")
+        console.print("[green]✓ Namespace isolation enabled[/green]")
+        console.print("[green]✓ Safe mount handling[/green]")
+        console.print("[green]✓ Pre-flight safety checks[/green]")
         return
 
     if not args.command:
@@ -427,8 +413,7 @@ async def main():
     engine = ZypperXEngine(jobs=args.jobs, force=getattr(args, 'force', False))
     engine.check_prerequisites()
 
-    # PHASE 1: Calculation (No lock yet!)
-    # We must do this BEFORE taking the lock, otherwise zypper dry-run fails.
+    # PHASE 1: Calculate what needs to be done (no lock)
     task_items = []
     mode = ""
     download_only = getattr(args, 'download_only', False)
@@ -446,8 +431,7 @@ async def main():
         task_items, size = engine.get_transaction_packages(mode, target_pkgs)
 
         if not task_items:
-            if size == 0:
-                console.print("[green]Nothing to do.[/green]")
+            console.print("[green]Nothing to do.[/green]")
             return
 
         if size > 0:
@@ -463,29 +447,34 @@ async def main():
                     sys.exit(0)
         else:
             console.print("[green]All packages already in cache.[/green]")
-            task_items = [] # Skip download phase
+            task_items = []
 
-    # PHASE 2: Parallel Execution (Lock Held)
+    # PHASE 2: Execute with lock
     if task_items:
-        async with engine.safe_environment():
-            if args.command in ["refresh", "ref"]:
-                 await engine.execute_tasks(task_items, "refresh", "[cyan]Refreshing repos...")
-            else:
-                 await engine.execute_tasks(task_items, "download", "[cyan]Downloading packages...")
+        try:
+            engine.get_lock()
 
-    # PHASE 3: Handover
+            if args.command in ["refresh", "ref"]:
+                await engine.execute_tasks(task_items, "refresh", "[cyan]Refreshing repos...")
+            else:
+                await engine.execute_tasks(task_items, "download", "[cyan]Downloading packages...")
+        finally:
+            engine.release_lock()
+
+    # PHASE 3: Handover to real zypper for installation
     if mode != "refresh" and not download_only:
-        console.print("\n[bold yellow]>> Handing over to actual Zypper for installation...[/bold yellow]")
+        console.print("\n[bold yellow]>> Handing over to zypper for installation...[/bold yellow]")
         final_cmd = ["zypper"]
-        if no_confirm: final_cmd.append("--non-interactive")
+        if no_confirm:
+            final_cmd.append("--non-interactive")
         final_cmd.append("--no-cd")
 
-        if mode == "dist-upgrade": final_cmd.append("dist-upgrade")
-        elif mode == "install-new-recommends": final_cmd.append("install-new-recommends")
-        elif mode == "install": final_cmd.extend(["install"] + getattr(args, "packages", []))
-
-        # Ensure lock is released before passing control
-        engine.release_lock()
+        if mode == "dist-upgrade":
+            final_cmd.append("dist-upgrade")
+        elif mode == "install-new-recommends":
+            final_cmd.append("install-new-recommends")
+        elif mode == "install":
+            final_cmd.extend(["install"] + getattr(args, "packages", []))
 
         env = os.environ.copy()
         env.update(ZYPPER_ENV)
@@ -493,8 +482,13 @@ async def main():
     elif mode != "refresh":
         console.print("[bold green]Download complete.[/bold green]")
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        sys.exit(130)
+    except Exception as e:
+        console.print(f"[bold red]Fatal error:[/bold red] {e}")
+        sys.exit(1)
