@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
 # ZypperX - Safe Parallel Wrapper for Zypper
-# v0.0.8 - No more conflicting options + extra CA certs + success summary
+# v0.0.9
 
 import os
 import sys
@@ -24,7 +24,7 @@ from rich.panel import Panel
 # Constants
 ZYPPER_PID_FILE = "/run/zypp.pid"
 ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
-VERSION = "0.0.8-safe"
+VERSION = "0.0.9-clean"
 
 class ExitCode:
     SUCCESS = 0
@@ -150,7 +150,7 @@ for f in resolv.conf hosts nsswitch.conf os-release; do
     [ -e "/etc/$f" ] && cp -L "/etc/$f" "$CHROOT/etc/$f" 2>/dev/null || true
 done
 
-# === EXTRA CA CERT PATHS (fixes SSL error 60 on Tumbleweed) ===
+# === EXTRA CA CERT PATHS (fixes SSL error 60) ===
 for certdir in /etc/ssl /etc/pki /etc/ca-certificates /usr/share/ca-certificates; do
     [ -d "$certdir" ] && mkdir -p "$CHROOT$certdir" && mount --bind -o ro "$certdir" "$CHROOT$certdir"
 done
@@ -303,7 +303,7 @@ class ZypperXEngine:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="ZypperX v0.0.8-safe - Safe Parallel Accelerator")
+    parser = argparse.ArgumentParser(description="ZypperX v0.0.9-clean - Safe Parallel Accelerator")
     parser.add_argument("-j", "--jobs", type=int, default=10, help="Number of parallel jobs")
     parser.add_argument("-y", "--no-confirm", action="store_true", help="Auto-confirm prompts")
     parser.add_argument("-f", "--force", action="store_true", help="Force refresh")
@@ -314,6 +314,7 @@ async def main():
 
     p_ref = subparsers.add_parser("refresh", aliases=["ref"])
     p_ref.add_argument("-f", "--force", action="store_true", help="Force refresh")
+    p_ref.add_argument("-c", "--clean", action="store_true", help="Run zypper clean --all before refreshing (recommended)")
 
     p_dup = subparsers.add_parser("dist-upgrade", aliases=["dup"])
     p_dup.add_argument("-d", "--download-only", action="store_true")
@@ -336,6 +337,12 @@ async def main():
 
     engine = ZypperXEngine(jobs=args.jobs, force=getattr(args, "force", False))
     engine.check_prerequisites()
+
+    # === NEW CLEAN FEATURE ===
+    if args.command in ["refresh", "ref"] and getattr(args, "clean", False):
+        console.print("[cyan]Running zypper clean --all before refresh...[/cyan]")
+        subprocess.run(["zypper", "--non-interactive", "clean", "--all"], check=False)
+        console.print("[green]Caches cleaned successfully.[/green]")
 
     task_items = []
     mode = ""
