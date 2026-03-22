@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
 # ZypperX - Safe Parallel Wrapper for Zypper
-# v1.1.0 - Fixed argparse conflicts, /var deletion bug, mount cleanup, and more
+# v1.1.1 - Fixed argparse conflicts, /var deletion bug, mount cleanup, and more
 
 import os
 import sys

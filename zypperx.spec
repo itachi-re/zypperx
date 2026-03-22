@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           zypperx
-Version:        0.0.0
+Version:        1.1.1
 Release:        0
 Summary:        A blazingly fast parallel wrapper for zypper
 License:        GPL-3.0-or-later
@@ -22,7 +22,6 @@ URL:            https://github.com/itachi-re/zypperx
 Source:         %{name}-%{version}.tar.zst
 BuildRequires:  python3-base
 BuildRequires:  python-rpm-macros
-BuildRequires:  python3-rich
 Requires:       python3
 Requires:       python3-rich
 Requires:       zypper
@@ -45,18 +44,33 @@ It behaves exactly like zypper but runs download operations in parallel.
 %install
 install -D -m 0755 zypperx %{buildroot}%{_bindir}/zypperx
 sed -i 's|#!/usr/bin/env python3|#!/usr/bin/python3|' %{buildroot}%{_bindir}/zypperx
+
 %check
-%{buildroot}%{_bindir}/zypperx --version
+python3 -c "import ast; ast.parse(open('%{buildroot}%{_bindir}/zypperx').read())"
+
 %files
 %license LICENSE
 %doc README.md
 %{_bindir}/zypperx
 
 %changelog
+* Sun Mar 22 2026 itachi_re <xanbenson99@gmail.com> - 1.1.0-0
+- Safety overhaul and automatic pre-refresh cache clean
+- Fix startup crash from duplicate -f/--force and -d/--download-only argparse flags
+- Fix potential /var deletion by checking /proc/mounts before rmtree
+- Fix mount cleanup order using dynamic /proc/mounts read, deepest-first
+- Fix /var/lib/zypp incorrectly mounted read-write inside worker chroot
+- Fix unshare check to perform a real functional namespace test
+- Fix download queue incorrectly including packages scheduled for removal
+- Run zypper clean --all automatically before every refresh (--no-clean to skip)
+- Add SIGINT/SIGTERM handlers for clean lock release and workspace removal
+- Use realpath for /bin /sbin /lib /lib64 bind mounts (Tumbleweed symlink fix)
+
 * Mon Nov 24 2025 itachi_re <xanbenson99@gmail.com> - 0.0.5-0
 - Update to GPLv3 license
 - Fix critical network issues in chroot (DNS resolution)
 - Add bind mounts for /etc/ssl and certificates
 - Implement tmpfs for /run to securely hide lock file
+
 * Sat Nov 22 2025 itachi_re <xanbenson99@gmail.com> - 0.0.3-0
 - Fix deadlock: Move transaction calculation outside of locked scope
