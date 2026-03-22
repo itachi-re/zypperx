@@ -25,7 +25,7 @@ from rich.panel import Panel
 # ─── Constants ────────────────────────────────────────────────────────────────
 ZYPPER_PID_FILE = "/run/zypp.pid"
 ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
-VERSION = "0.1.1"
+VERSION = "1.1.1"
 
 # CA cert directories that need to be bind-mounted for SSL to work in chroot
 CERT_DIRS = [
@@ -334,13 +334,44 @@ if [ -d /etc/zypp ]; then
     mount --bind -o ro /etc/zypp "$CHROOT/etc/zypp"
 fi
 
-# CA certificates — fixes SSL curl error 60 on Tumbleweed
+# ── CA certificates — belt-and-suspenders approach ───────────────────────────
+# Strategy 1: bind-mount every known cert directory (handles most distros)
 {cert_lines}
 
-# Execute zypper inside the isolated chroot
+# Strategy 2: resolve the actual CA bundle file following all symlinks and
+# copy it directly into the chroot. This is the critical fix for Tumbleweed
+# where /etc/ssl/ca-bundle.pem -> /var/lib/ca-certificates/ca-bundle.pem.
+# Even if the bind mounts above land correctly, absolute symlinks inside a
+# chroot can silently break when the target path resolves through a mount
+# boundary. Copying the real file eliminates that ambiguity entirely.
+mkdir -p "$CHROOT/etc/ssl"
+mkdir -p "$CHROOT/var/lib/ca-certificates"
+for _candidate in \\
+    /etc/ssl/ca-bundle.pem \\
+    /var/lib/ca-certificates/ca-bundle.pem \\
+    /etc/ssl/certs/ca-certificates.crt \\
+    /etc/pki/tls/certs/ca-bundle.crt \\
+    /etc/ssl/cert.pem; do
+    if [ -e "$_candidate" ]; then
+        _real=$(realpath "$_candidate" 2>/dev/null || echo "$_candidate")
+        if [ -f "$_real" ]; then
+            # Copy the real file (not the symlink) to both canonical paths
+            cp "$_real" "$CHROOT/etc/ssl/ca-bundle.pem"
+            cp "$_real" "$CHROOT/var/lib/ca-certificates/ca-bundle.pem"
+            break
+        fi
+    fi
+done
+
+# Execute zypper inside the isolated chroot.
+# SSL_CERT_FILE and CURL_CA_BUNDLE tell libcurl/openssl exactly where the
+# bundle is so they never fall back to compiled-in defaults that may not
+# exist inside the chroot.
 chroot "$CHROOT" env -i \\
     ZYPP_CURL2=1 ZYPP_PCK_PRELOAD=1 ZYPP_SINGLE_RPMTRANS=1 \\
     PATH=/usr/bin:/bin:/sbin HOME=/tmp LANG=C.UTF-8 \\
+    SSL_CERT_FILE=/etc/ssl/ca-bundle.pem \\
+    CURL_CA_BUNDLE=/etc/ssl/ca-bundle.pem \\
     zypper --non-interactive {" ".join(zypper_args)}
 """
         return script
