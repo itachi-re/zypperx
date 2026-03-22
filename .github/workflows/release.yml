@@ -2,7 +2,13 @@ name: Publish RPM to Release
 on:
   push:
     tags:
-      - '*.*.*'  # Matches any semver tag: 1.1.0, 1.1.1, 2.0.0 etc.
+      - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 1.1.0)'
+        required: true
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -16,7 +22,12 @@ jobs:
 
       - name: Download RPM
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
+          # Use input version if manually triggered, otherwise use the tag
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
           echo "Downloading RPMs for version $VERSION..."
           mkdir -p downloads
           wget -r -l1 -nd -A "zypperx-$VERSION-*.noarch.rpm" -P downloads \
@@ -25,6 +36,7 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
           files: downloads/*.rpm
           draft: false
           prerelease: false
