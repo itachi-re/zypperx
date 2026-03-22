@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
 # ZypperX - Safe Parallel Wrapper for Zypper
-# v0.0.6 - Complete rewrite with namespace isolation
-#
-# ZypperX is free software: you can redistribute it and/or modify it
-# under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+# v0.0.7-safe - Critical mount-safety rewrite + full chroot
 
 import os
 import sys
@@ -31,10 +26,7 @@ from rich.panel import Panel
 # Constants
 ZYPPER_PID_FILE = "/run/zypp.pid"
 ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
-VERSION = "0.0.6-safe"
-
-# CRITICAL SAFETY: Paths that MUST NEVER be mounted over
-PROTECTED_PATHS = {"/", "/var", "/home", "/root", "/etc", "/usr", "/boot", "/bin", "/sbin", "/lib", "/lib64"}
+VERSION = "0.0.7-safe"
 
 class ExitCode:
     SUCCESS = 0
@@ -64,9 +56,8 @@ class SafetyChecker:
                 if temp_prefix in mounts:
                     console.print(f"[bold red]DANGER:[/bold red] Found leftover mounts from previous run!")
                     console.print("[yellow]Run this command to clean up:[/yellow]")
-                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/rootfs/*/* 2>/dev/null || true")
-                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/rootfs/* 2>/dev/null || true")
-                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/rootfs 2>/dev/null || true")
+                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/chroot/* 2>/dev/null || true")
+                    console.print(f"  sudo umount -l /tmp/{temp_prefix}*/chroot 2>/dev/null || true")
                     console.print(f"  sudo rm -rf /tmp/{temp_prefix}*")
                     return False
         except IOError:
@@ -111,11 +102,9 @@ class NamespacedWorker:
     async def execute(self) -> Tuple[int, str]:
         """Execute task in complete isolation using unshare."""
 
-        # Create isolated workspace
         self.workspace = tempfile.mkdtemp(prefix=f"zypperx_worker_{self.worker_id}_")
 
         try:
-            # Build the command that will run in isolated namespace
             if self.task_type == "refresh":
                 zypper_args = ["refresh", "--force", self.task_item]
             elif self.task_type == "download":
@@ -123,12 +112,10 @@ class NamespacedWorker:
             else:
                 return 1, f"Unknown task type: {self.task_type}"
 
-            # CRITICAL: Use unshare to create isolated mount namespace
-            # This ensures ALL mounts are private and auto-cleanup on exit
             cmd = [
                 "unshare",
-                "--mount",           # Private mount namespace
-                "--propagation", "private",  # Don't propagate mounts to parent
+                "--mount",
+                "--propagation", "private",
                 "sh", "-c",
                 self._build_isolated_script(zypper_args)
             ]
@@ -149,62 +136,85 @@ class NamespacedWorker:
             return 0, "Success"
 
         finally:
-            # Cleanup workspace (mounts already gone due to namespace isolation)
+            # CRITICAL SAFETY: Unmount everything BEFORE rmtree (prevents /var deletion even if isolation fails)
             if self.workspace and os.path.exists(self.workspace):
+                chroot_dir = os.path.join(self.workspace, "chroot")
+                if os.path.exists(chroot_dir):
+                    mount_points = [
+                        f"{chroot_dir}/var/cache/zypp",
+                        f"{chroot_dir}/var/lib/zypp",
+                        f"{chroot_dir}/dev", f"{chroot_dir}/proc", f"{chroot_dir}/sys",
+                        f"{chroot_dir}/etc/zypp", f"{chroot_dir}/etc/ssl",
+                        f"{chroot_dir}/usr", f"{chroot_dir}/bin", f"{chroot_dir}/sbin",
+                        f"{chroot_dir}/lib", f"{chroot_dir}/lib64",
+                        f"{chroot_dir}/etc", f"{chroot_dir}/tmp", f"{chroot_dir}/run",
+                    ]
+                    for mp in mount_points:
+                        if os.path.exists(mp):
+                            subprocess.run(["umount", "-l", mp], capture_output=True, timeout=5, check=False)
                 shutil.rmtree(self.workspace, ignore_errors=True)
 
     def _build_isolated_script(self, zypper_args: List[str]) -> str:
-        """Build shell script that sets up minimal chroot in isolated namespace."""
-
-        # SAFETY: We only mount what we absolutely need, and ONLY in the isolated namespace
+        """Build shell script that sets up a functional chroot in isolated namespace."""
         script = f"""
 set -e
 
-# Create minimal directory structure
 CHROOT="{self.workspace}/chroot"
-mkdir -p "$CHROOT"{{/dev,/proc,/sys,/tmp,/run,/var/cache/zypp,/etc}}
+mkdir -p "$CHROOT"{{/dev,/proc,/sys,/tmp,/run,/var/cache/zypp,/var/lib/zypp,/etc,/usr,/bin,/sbin,/lib,/lib64}}
 
-# Mount ONLY what's needed (these are invisible to host due to unshare)
+# Basic mounts
 mount -t tmpfs tmpfs "$CHROOT/tmp"
 mount -t tmpfs tmpfs "$CHROOT/run"
 mount --bind -o ro /dev "$CHROOT/dev"
 mount --bind -o ro /proc "$CHROOT/proc"
 mount --bind -o ro /sys "$CHROOT/sys"
 
-# Share package cache (read-write for downloads)
-mount --bind /var/cache/zypp "$CHROOT/var/cache/zypp"
+# Full OS binds so zypper actually works
+for dir in /usr /bin /sbin /lib /lib64; do
+    if [ -d "$dir" ]; then
+        mount --bind -o ro "$dir" "$CHROOT$dir"
+    fi
+done
 
-# Copy minimal network config
-cp /etc/resolv.conf "$CHROOT/etc/resolv.conf" 2>/dev/null || true
+# Package cache + metadata (shared read-write)
+if [ -d /var/cache/zypp ]; then
+    mount --bind /var/cache/zypp "$CHROOT/var/cache/zypp"
+fi
+if [ -d /var/lib/zypp ]; then
+    mount --bind /var/lib/zypp "$CHROOT/var/lib/zypp"
+fi
 
-# Bind SSL certificates (read-only)
+# Network + config (copy to avoid symlink issues)
+mkdir -p "$CHROOT/etc"
+for f in resolv.conf hosts nsswitch.conf os-release; do
+    if [ -e "/etc/$f" ]; then
+        cp -L "/etc/$f" "$CHROOT/etc/$f" 2>/dev/null || true
+    fi
+done
+
+# zypp config and SSL
+if [ -d /etc/zypp ]; then
+    mkdir -p "$CHROOT/etc/zypp"
+    mount --bind -o ro /etc/zypp "$CHROOT/etc/zypp"
+fi
 if [ -d /etc/ssl ]; then
     mkdir -p "$CHROOT/etc/ssl"
     mount --bind -o ro /etc/ssl "$CHROOT/etc/ssl"
 fi
 
-# Bind zypper binaries and libraries (read-only)
-for path in /usr/bin/zypper /usr/lib/zypper /usr/share/zypper; do
-    if [ -e "$path" ]; then
-        mkdir -p "$CHROOT$(dirname $path)"
-        mount --bind -o ro "$path" "$CHROOT$path"
-    fi
-done
-
-# Execute zypper in the isolated chroot
-chroot "$CHROOT" env -i \
-    ZYPP_CURL2=1 \
-    ZYPP_PCK_PRELOAD=1 \
-    ZYPP_SINGLE_RPMTRANS=1 \
-    PATH=/usr/bin:/bin \
+# Run zypper
+chroot "$CHROOT" env -i \\
+    ZYPP_CURL2=1 \\
+    ZYPP_PCK_PRELOAD=1 \\
+    ZYPP_SINGLE_RPMTRANS=1 \\
+    PATH=/usr/bin:/bin:/sbin \\
+    HOME=/tmp \\
+    LANG=C.UTF-8 \\
     zypper --non-interactive {' '.join(zypper_args)}
-
-# Cleanup is automatic when namespace exits
 """
         return script
 
     def _build_env(self) -> dict:
-        """Build minimal environment for worker."""
         return {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "HOME": "/tmp",
@@ -226,19 +236,15 @@ class ZypperXEngine:
             console.print("[bold red]Error:[/bold red] ZypperX must be run as root (sudo).")
             sys.exit(ExitCode.ERROR)
 
-        # Check for leftover mounts
         if not SafetyChecker.verify_no_ghost_mounts():
             sys.exit(ExitCode.ERROR)
 
-        # Check filesystem health
         if not SafetyChecker.verify_filesystem_health():
             sys.exit(ExitCode.ERROR)
 
-        # Check unshare support
         if not SafetyChecker.check_unshare_support():
             sys.exit(ExitCode.ERROR)
 
-        # Check dependencies
         required = ["zypper", "mount", "umount", "chroot", "unshare"]
         missing = [prog for prog in required if shutil.which(prog) is None]
         if missing:
@@ -298,9 +304,9 @@ class ZypperXEngine:
 
             async def worker(idx: int, item: str):
                 async with self.sem:
-                    worker = NamespacedWorker(f"{idx}", task_type, item)
+                    w = NamespacedWorker(f"{idx}", task_type, item)
                     try:
-                        code, msg = await worker.execute()
+                        code, msg = await w.execute()
                         if code != 0:
                             log.error(f"Failed: {item} - {msg}")
                     except Exception as e:
@@ -314,7 +320,6 @@ class ZypperXEngine:
         """Retrieve list of enabled repositories."""
         console.print("[cyan]Scanning enabled repositories...[/cyan]")
         cmd = ["zypper", "--non-interactive", "--no-cd", "--xmlout", "repos"]
-
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             console.print("[bold red]Failed to list repositories.[/bold red]")
@@ -360,12 +365,7 @@ class ZypperXEngine:
                     pkg_str = f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}"
                     to_install.append(pkg_str)
 
-            to_remove = []
-            for rm in root.iter("to-remove"):
-                for solv in rm.findall("solvable"):
-                    to_remove.append(f"{solv.attrib['name']}-{solv.attrib['edition']}.{solv.attrib['arch']}")
-
-            final_list = list(set(to_install) - set(to_remove))
+            final_list = list(set(to_install))
             final_list.sort()
             return final_list, download_size
 
@@ -375,7 +375,7 @@ class ZypperXEngine:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="ZypperX v0.0.6 - Safe Parallel Accelerator")
+    parser = argparse.ArgumentParser(description="ZypperX v0.0.7-safe - Safe Parallel Accelerator")
     parser.add_argument("-j", "--jobs", type=int, default=10, help="Number of parallel jobs")
     parser.add_argument("-y", "--no-confirm", action="store_true", help="Auto-confirm prompts")
     parser.add_argument("-f", "--force", action="store_true", help="Force refresh")
@@ -401,9 +401,6 @@ async def main():
 
     if args.version:
         console.print(f"[bold cyan]ZypperX {VERSION}[/bold cyan]")
-        console.print("[green]✓ Namespace isolation enabled[/green]")
-        console.print("[green]✓ Safe mount handling[/green]")
-        console.print("[green]✓ Pre-flight safety checks[/green]")
         return
 
     if not args.command:
