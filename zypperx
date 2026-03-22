@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
 # ZypperX - Safe Parallel Wrapper for Zypper
-# v0.1.0 - Fixed argparse conflicts, /var deletion bug, mount cleanup, and more
+# v1.1.0 - Fixed argparse conflicts, /var deletion bug, mount cleanup, and more
 
 import os
 import sys
@@ -25,7 +25,7 @@ from rich.panel import Panel
 # ─── Constants ────────────────────────────────────────────────────────────────
 ZYPPER_PID_FILE = "/run/zypp.pid"
 ZYPPER_ENV = {"ZYPP_CURL2": "1", "ZYPP_PCK_PRELOAD": "1", "ZYPP_SINGLE_RPMTRANS": "1"}
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # CA cert directories that need to be bind-mounted for SSL to work in chroot
 CERT_DIRS = [
@@ -575,11 +575,11 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  sudo zypperx refresh\n"
-            "  sudo zypperx ref -f          # force-refresh all repos\n"
-            "  sudo zypperx ref -c          # clean cache, then refresh\n"
-            "  sudo zypperx dup -j 20       # parallel dist-upgrade, 20 workers\n"
-            "  sudo zypperx in firefox -y   # install firefox, no confirmation\n"
+            "  sudo zypperx refresh             # cleans cache then refreshes all repos\n"
+            "  sudo zypperx ref --no-clean      # refresh without clearing cache first\n"
+            "  sudo zypperx ref -f              # force-refresh all repos\n"
+            "  sudo zypperx dup -j 20           # parallel dist-upgrade, 20 workers\n"
+            "  sudo zypperx in firefox -y       # install firefox, no confirmation\n"
         ),
     )
     parser.add_argument(
@@ -598,14 +598,14 @@ async def main():
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     # refresh / ref
-    p_ref = sub.add_parser("refresh", aliases=["ref"], help="Refresh repositories in parallel")
+    p_ref = sub.add_parser("refresh", aliases=["ref"], help="Refresh repositories in parallel (always cleans cache first)")
     p_ref.add_argument(
         "-f", "--force", action="store_true",
         help="Force refresh even if repos appear up to date",
     )
     p_ref.add_argument(
-        "-c", "--clean", action="store_true",
-        help="Run 'zypper clean --all' before refreshing (clears stale metadata)",
+        "--no-clean", action="store_true",
+        help="Skip the automatic 'zypper clean --all' that normally runs before refresh",
     )
 
     # dist-upgrade / dup
@@ -635,7 +635,7 @@ async def main():
     # Pull per-subcommand flags (absent on subcommands that don't define them)
     force = getattr(args, "force", False)
     download_only = getattr(args, "download_only", False)
-    do_clean = getattr(args, "clean", False)
+    no_clean = getattr(args, "no_clean", False)
     no_confirm = args.no_confirm
 
     engine = ZypperXEngine(jobs=args.jobs, force=force)
@@ -650,17 +650,26 @@ async def main():
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    # ── Optional pre-refresh cache clean ────────────────────────────────────
-    if args.command in ("refresh", "ref") and do_clean:
-        console.print("[cyan]Running zypper clean --all before refresh...[/cyan]")
-        result = subprocess.run(
-            ["zypper", "--non-interactive", "clean", "--all"],
-            check=False,
-        )
-        if result.returncode == 0:
-            console.print("[green]Cache cleaned.[/green]")
+    # ── Always clean repo metadata cache before refresh ───────────────────────
+    # Stale/corrupt metadata in /var/cache/zypp is the #1 cause of SSL and
+    # "invalid repository" errors. Cleaning first ensures workers always
+    # fetch a fresh copy. Pass --no-clean to skip this if you're in a hurry.
+    if args.command in ("refresh", "ref"):
+        if not no_clean:
+            console.print("[cyan]Cleaning repo metadata cache (zypper clean --all)...[/cyan]")
+            result = subprocess.run(
+                ["zypper", "--non-interactive", "clean", "--all"],
+                check=False,
+            )
+            if result.returncode == 0:
+                console.print("[green]✓ Cache cleared.[/green]")
+            else:
+                console.print(
+                    "[yellow]Warning: zypper clean returned a non-zero exit code "
+                    "(continuing anyway).[/yellow]"
+                )
         else:
-            console.print("[yellow]Warning: zypper clean returned non-zero exit code.[/yellow]")
+            console.print("[yellow]Skipping cache clean (--no-clean passed).[/yellow]")
 
     # ── Build task list ───────────────────────────────────────────────────────
     task_items: List[str] = []
