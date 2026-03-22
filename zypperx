@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 itachi_re <xanbenson99@gmail.com>
 # ZypperX - Safe Parallel Wrapper for Zypper
-# v1.1.1 - Fixed argparse conflicts, /var deletion bug, mount cleanup, and more
+# v1.1.2 - Fixed argparse conflicts, /var deletion bug, mount cleanup, and more
 
 import os
 import sys
@@ -29,7 +29,6 @@ VERSION = "1.1.1"
 
 # CA cert directories that need to be bind-mounted for SSL to work in chroot
 CERT_DIRS = [
-    "/etc/ssl",
     "/etc/pki",
     "/etc/ca-certificates",
     "/usr/share/ca-certificates",
@@ -202,7 +201,12 @@ class NamespacedWorker:
             stdout, stderr = await proc.communicate()
 
             if proc.returncode != 0:
-                return proc.returncode, stderr.decode("utf-8", errors="ignore").strip()
+                # Combine stdout + stderr — zypper writes its human-readable
+                # error (including the curl error code) to stdout, not stderr.
+                out = stdout.decode("utf-8", errors="ignore").strip()
+                err = stderr.decode("utf-8", errors="ignore").strip()
+                combined = "\n".join(filter(None, [out, err]))
+                return proc.returncode, combined
             return 0, "Success"
 
         finally:
@@ -295,6 +299,47 @@ mkdir -p "$CHROOT/sbin"
 mkdir -p "$CHROOT/lib"
 mkdir -p "$CHROOT/lib64"
 
+# ── CA bundle copy — must happen BEFORE any bind-mounts ─────────────────────
+# /etc/ssl and /var/lib/ca-certificates are plain empty directories at this
+# point (created by mkdir above). We resolve the real CA bundle file on the
+# host (following all symlinks) and copy the actual bytes in. This avoids
+# the read-only-filesystem error that occurs if we try to write after
+# bind-mounting /etc/ssl, and avoids the dangling-symlink error that occurs
+# because ca-bundle.pem -> /var/lib/ca-certificates/ca-bundle.pem is an
+# absolute symlink that points outside the chroot.
+mkdir -p "$CHROOT/etc/ssl/certs"
+mkdir -p "$CHROOT/var/lib/ca-certificates"
+_ca_copied=0
+for _candidate in \\
+    /var/lib/ca-certificates/ca-bundle.pem \\
+    /etc/ssl/ca-bundle.pem \\
+    /etc/ssl/certs/ca-certificates.crt \\
+    /etc/pki/tls/certs/ca-bundle.crt \\
+    /etc/ssl/cert.pem; do
+    if [ -e "$_candidate" ]; then
+        _real=$(realpath "$_candidate" 2>/dev/null || echo "$_candidate")
+        if [ -f "$_real" ]; then
+            # Copy the real bundle to every path curl/openssl might look for
+            cp "$_real" "$CHROOT/etc/ssl/ca-bundle.pem"
+            cp "$_real" "$CHROOT/etc/ssl/certs/ca-certificates.crt"
+            cp "$_real" "$CHROOT/var/lib/ca-certificates/ca-bundle.pem"
+            _ca_copied=1
+            break
+        fi
+    fi
+done
+[ "$_ca_copied" = "0" ] && echo "WARNING: no CA bundle found on host" >&2
+
+# /etc/ssl/certs/ — bind-mount the host hash directory on top of what we
+# just created. OpenSSL uses this directory for certificate chain lookup
+# (hashed symlinks like ab12cd34.0 -> individual CA certs). Without it,
+# intermediate certificate verification fails with error 20 even when the
+# root bundle is present. We mount only this subdirectory, not /etc/ssl
+# itself, to avoid overwriting the ca-bundle.pem we just copied above.
+if [ -d /etc/ssl/certs ]; then
+    mount --bind -o ro /etc/ssl/certs "$CHROOT/etc/ssl/certs"
+fi
+
 # Ephemeral tmpfs for /tmp and /run (no host data leaks)
 mount -t tmpfs tmpfs "$CHROOT/tmp"
 mount -t tmpfs tmpfs "$CHROOT/run"
@@ -334,34 +379,10 @@ if [ -d /etc/zypp ]; then
     mount --bind -o ro /etc/zypp "$CHROOT/etc/zypp"
 fi
 
-# ── CA certificates — belt-and-suspenders approach ───────────────────────────
-# Strategy 1: bind-mount every known cert directory (handles most distros)
+# Bind-mount remaining cert dirs (/etc/pki, /etc/ca-certificates,
+# /usr/share/ca-certificates). /etc/ssl and /var/lib/ca-certificates
+# were already populated above by direct file copy, so they are excluded.
 {cert_lines}
-
-# Strategy 2: resolve the actual CA bundle file following all symlinks and
-# copy it directly into the chroot. This is the critical fix for Tumbleweed
-# where /etc/ssl/ca-bundle.pem -> /var/lib/ca-certificates/ca-bundle.pem.
-# Even if the bind mounts above land correctly, absolute symlinks inside a
-# chroot can silently break when the target path resolves through a mount
-# boundary. Copying the real file eliminates that ambiguity entirely.
-mkdir -p "$CHROOT/etc/ssl"
-mkdir -p "$CHROOT/var/lib/ca-certificates"
-for _candidate in \\
-    /etc/ssl/ca-bundle.pem \\
-    /var/lib/ca-certificates/ca-bundle.pem \\
-    /etc/ssl/certs/ca-certificates.crt \\
-    /etc/pki/tls/certs/ca-bundle.crt \\
-    /etc/ssl/cert.pem; do
-    if [ -e "$_candidate" ]; then
-        _real=$(realpath "$_candidate" 2>/dev/null || echo "$_candidate")
-        if [ -f "$_real" ]; then
-            # Copy the real file (not the symlink) to both canonical paths
-            cp "$_real" "$CHROOT/etc/ssl/ca-bundle.pem"
-            cp "$_real" "$CHROOT/var/lib/ca-certificates/ca-bundle.pem"
-            break
-        fi
-    fi
-done
 
 # Execute zypper inside the isolated chroot.
 # SSL_CERT_FILE and CURL_CA_BUNDLE tell libcurl/openssl exactly where the
