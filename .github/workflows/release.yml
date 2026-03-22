@@ -15,10 +15,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      # Only wait on tag push — OBS was just triggered by the webhook.
-      # On manual runs the RPM already exists on OBS from the original tag push.
       - name: Wait for OBS to build (tag push only)
         if: github.event_name == 'push'
         run: sleep 120
@@ -35,7 +33,6 @@ jobs:
           wget -r -l1 -nd -A "zypperx-$VERSION-*.noarch.rpm" -P downloads \
             "https://download.opensuse.org/repositories/home:/itachi_re/openSUSE_Tumbleweed/noarch/"
 
-          # Fail early if nothing was downloaded
           if [ -z "$(ls downloads/*.rpm 2>/dev/null)" ]; then
             echo "ERROR: No RPM found for version $VERSION on OBS."
             echo "Make sure the tag exists and OBS has finished building it."
@@ -43,7 +40,7 @@ jobs:
           fi
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
           files: downloads/*.rpm
